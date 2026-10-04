@@ -1,4 +1,4 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import type { ReactNode } from "react";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -20,8 +20,28 @@ const mono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Todo Agent",
+  title: "Iris",
+  applicationName: "Iris",
   description: "A todo manager built on the Claude Agent SDK.",
+  appleWebApp: { capable: true, title: "Iris", statusBarStyle: "default" },
+  icons: {
+    icon: [
+      // Adaptive SVG: switches between the light and dark mark with the OS theme.
+      { url: "/icon.svg", type: "image/svg+xml" },
+      { url: "/favicon.ico", sizes: "16x16 32x32 48x48" },
+    ],
+    apple: [
+      { url: "/icons/apple-touch-icon-light.png", sizes: "180x180", media: "(prefers-color-scheme: light)" },
+      { url: "/icons/apple-touch-icon-dark.png", sizes: "180x180", media: "(prefers-color-scheme: dark)" },
+    ],
+  },
+};
+
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#09090b" },
+  ],
 };
 
 export default function RootLayout({ children }: { readonly children: ReactNode }) {
