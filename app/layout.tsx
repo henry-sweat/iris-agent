@@ -30,10 +30,9 @@ export const metadata: Metadata = {
       { url: "/icon.svg", type: "image/svg+xml" },
       { url: "/favicon.ico", sizes: "16x16 32x32 48x48" },
     ],
-    apple: [
-      { url: "/icons/apple-touch-icon-light.png", sizes: "180x180", media: "(prefers-color-scheme: light)" },
-      { url: "/icons/apple-touch-icon-dark.png", sizes: "180x180", media: "(prefers-color-scheme: dark)" },
-    ],
+    // iOS ignores `media` on apple-touch-icon and takes the first entry, so ship one. Keep in sync with
+    // ICON_THEME in app/manifest.ts.
+    apple: { url: "/icons/apple-touch-icon-dark.png", sizes: "180x180" },
   },
 };
 
