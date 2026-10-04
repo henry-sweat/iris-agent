@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { readFile, rename, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import path from "node:path";
 import { z } from "zod";
 import { dateIn } from "./dates";
 import { goals as seedGoals, tasks as seedTasks } from "./seed";
@@ -40,6 +41,8 @@ export function createStore(file: string, timeZone: string): Store {
   }
 
   async function save(data: StoreData): Promise<void> {
+    // The data directory is gitignored, so it may not exist yet on a fresh clone.
+    await mkdir(path.dirname(file), { recursive: true });
     const tmp = `${file}.${randomUUID()}.tmp`;
     await writeFile(tmp, `${JSON.stringify(data, null, 2)}\n`);
     await rename(tmp, file);

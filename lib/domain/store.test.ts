@@ -43,3 +43,15 @@ describe("v1 → v2 migration", () => {
     expect(JSON.parse(await readFile(file, "utf8")).version).toBe(2);
   });
 });
+
+describe("missing data file", () => {
+  it("creates the parent directory and file on the first write", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "todo-agent-"));
+    const file = path.join(dir, "nested", "data", "todo.json");
+    const store = createStore(file, "America/New_York");
+
+    expect(await store.read()).toEqual({ version: 2, goals: [], tasks: [], occurrences: [] });
+    await store.mutate(() => ({ changed: true, result: undefined }));
+    expect(JSON.parse(await readFile(file, "utf8")).version).toBe(2);
+  });
+});
