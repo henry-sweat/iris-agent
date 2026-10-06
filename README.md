@@ -15,6 +15,9 @@ Everything is organized around three **pillars**: health, wealth and happiness.
 - **Agent chat**: a Claude agent (via the [Claude Agent SDK](https://docs.claude.com/en/docs/agent-sdk/overview))
   that can read your agenda, check things off, create and edit tasks and goals, and summarize progress by pillar.
   Conversations are resumable at `/s/<sessionId>`.
+- **Google Calendar (optional)**: the agent reads your primary calendar so it plans around your meetings. Ad hoc
+  to-dos that are really appointments ("dentist Tue 3pm") get a time slot and show up as events on your calendar;
+  renaming or rescheduling the to-do updates the event. Iris never edits events it didn't create.
 
 ## Getting started
 
@@ -35,8 +38,27 @@ Open http://localhost:3000.
 | `ANTHROPIC_API_KEY` | required for chat  | Used by the Agent SDK's CLI process to call Claude.      |
 | `TODO_DATA_FILE`    | `data/todo.json`   | Path to the JSON data store. Created on first write.     |
 | `TODO_TIME_ZONE`    | `America/New_York` | Time zone that decides what "today" is.                  |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN` | unset | Optional Google Calendar access (below). |
 
 The API key is used only by the chat. It stays on the server and is never sent to the browser.
+
+### Google Calendar (optional)
+
+A plain Google API key can only read public calendars, so this uses OAuth with the `calendar.events` scope (read
+events, and create and edit the appointment events Iris owns). Set it up once:
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create a project and enable the
+   **Google Calendar API**.
+2. Configure the OAuth consent screen (External), add yourself as a user, then set its publishing status to
+   **In production**. While it's in "Testing", Google expires refresh tokens after 7 days. An unverified app is fine
+   for personal use; you'll click through a warning once.
+3. Create an OAuth client ID of type **Desktop app**, and put its ID and secret in `.env.local` as
+   `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`.
+4. Run `npm run gcal:auth`, open the printed URL, approve, and copy the printed `GOOGLE_REFRESH_TOKEN=…` line into
+   `.env.local`. Restart the dev server.
+
+With any of the three variables unset, the calendar tool is left out and appointments are unavailable. If you set this
+up when it was read-only, run `npm run gcal:auth` again: the old token only has the `calendar.readonly` scope.
 
 ## Scripts
 
@@ -47,6 +69,7 @@ The API key is used only by the chat. It stays on the server and is never sent t
 | `npm start`         | Serve the production build.                        |
 | `npm run typecheck` | `tsc --noEmit`.                                    |
 | `npm test`          | Run the vitest suite (`lib/**/*.test.ts`).         |
+| `npm run gcal:auth` | One-time Google Calendar OAuth; prints a refresh token. |
 
 ## Architecture
 
@@ -65,6 +88,8 @@ lib/
     run.ts                   runs one agent turn via the Claude Agent SDK
     tools.ts                 MCP tools exposed to the agent
     system-prompt.ts         agent instructions
+  calendar/                  optional Google Calendar client: reading events, syncing appointment events
+scripts/gcal-auth.ts         one-time OAuth consent for Google Calendar
 components/ui, components/ai-elements   vendored shadcn / AI Elements components
 ```
 
@@ -76,7 +101,8 @@ How the pieces fit together:
   are deterministic (`<taskId>@<YYYY-MM-DD>`), so they never duplicate. Changing a task's schedule removes only
   *pending* occurrences, so done and skipped history is kept.
 - **The agent can only touch your to-dos.** It has no built-in tools (no Bash, file access, etc.) and ignores local
-  Claude settings. Its only tools are the `mcp__todos__*` tools in `lib/agent/tools.ts`.
+  Claude settings. Its only tools are the `mcp__todos__*` tools in `lib/agent/tools.ts` (including
+  `getCalendarEvents` when Google Calendar is configured).
 
 ### HTTP API
 

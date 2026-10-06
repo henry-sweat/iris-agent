@@ -35,6 +35,19 @@ export type Goal = z.infer<typeof Goal>;
 export const MissPolicy = z.enum(["skip", "carry"]);
 export type MissPolicy = z.infer<typeof MissPolicy>;
 
+/** 'HH:mm', 24-hour wall-clock time in the user's time zone. */
+export const LocalTime = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Expected HH:mm (24-hour)");
+
+/** A time slot on an ad hoc task's dueAt, mirrored to an event on the user's Google Calendar. */
+export const Appointment = z.object({
+  start: LocalTime,
+  end: LocalTime,
+  location: z.string().optional(),
+  /** Google Calendar event created for this task; absent until the first successful sync. */
+  eventId: z.string().optional(),
+});
+export type Appointment = z.infer<typeof Appointment>;
+
 export const Task = z.object({
   id: z.string(),
   title: z.string(),
@@ -48,6 +61,8 @@ export const Task = z.object({
   startDate: ISODate,
   /** Ad hoc only. */
   dueAt: ISODate.optional(),
+  /** Ad hoc with dueAt only. Additive optional field, so v2 files load unchanged. */
+  appointment: Appointment.optional(),
   missPolicy: MissPolicy,
   /** false = archived; no new occurrences. */
   active: z.boolean(),
@@ -89,7 +104,8 @@ export type DomainErrorCode =
   | "UNKNOWN_GOAL"
   | "GOAL_PILLAR_MISMATCH"
   | "GOAL_CYCLE"
-  | "INVALID_INPUT";
+  | "INVALID_INPUT"
+  | "CALENDAR_UNAVAILABLE";
 
 /** An expected, user-facing failure with a machine-readable code. */
 export class DomainError extends Error {

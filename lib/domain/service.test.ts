@@ -2,6 +2,7 @@ import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import type { AppointmentCalendar } from "@/lib/calendar/appointments";
 import { addDays } from "./dates";
 import { createServices } from "./service";
 import { createStore } from "./store";
@@ -321,5 +322,107 @@ describe("getPillarSummary", () => {
     ]);
     expect(summary.unaligned).toEqual({ done: 0, skipped: 0, pending: 1 });
     expect(summary.unalignedTaskCount).toBe(1);
+  });
+});
+
+describe("appointments", () => {
+  function fakeCalendar() {
+    const calls: string[] = [];
+    let next = 1;
+    let failing = false;
+    const calendar: AppointmentCalendar = {
+      async upsert({ taskId, title, date, appointment }) {
+        if (failing) throw new DomainError("CALENDAR_UNAVAILABLE", "Google Calendar request failed: offline");
+        const id = appointment.eventId ?? `evt-${next++}`;
+        calls.push(`upsert ${id} ${taskId} ${title} ${date} ${appointment.start}-${appointment.end}`);
+        return id;
+      },
+      async remove(eventId) {
+        calls.push(`remove ${eventId}`);
+      },
+    };
+    return { calendar, calls, fail: (value: boolean) => (failing = value) };
+  }
+
+  async function setupWithCalendar() {
+    const base = await setup("2026-10-05");
+    const fake = fakeCalendar();
+    const services = createServices({
+      store: base.store,
+      timeZone: TZ,
+      now: () => new Date("2026-10-05T16:00:00Z"),
+      calendar: fake.calendar,
+    });
+    return { ...base, ...fake, services };
+  }
+
+  const slot = { start: "15:00", end: "16:00", location: "Main St" };
+
+  it("creates the event and stores its id on the task", async () => {
+    const { services, calls } = await setupWithCalendar();
+    const { task, calendarError } = await services.createTask({ title: "Dentist", dueAt: "2026-10-07", appointment: slot });
+    expect(calendarError).toBeUndefined();
+    expect(task.appointment).toEqual({ ...slot, eventId: "evt-1" });
+    expect(calls).toEqual(["upsert evt-1 task-dentist Dentist 2026-10-07 15:00-16:00"]);
+    const agenda = await services.getAgenda("2026-10-07", "2026-10-07");
+    expect(agenda.items[0].appointment).toEqual(slot);
+  });
+
+  it("updates the event on rename and reschedule, but not on archive", async () => {
+    const { services, calls } = await setupWithCalendar();
+    const { task } = await services.createTask({ title: "Dentist", dueAt: "2026-10-07", appointment: slot });
+    await services.updateTask(task.id, { dueAt: "2026-10-08" });
+    await services.updateTask(task.id, { title: "Dentist cleaning" });
+    await services.updateTask(task.id, { appointment: { start: "09:00", end: "09:30" } });
+    const archived = await services.archiveTask(task.id);
+    expect(archived.appointment).toEqual({ start: "09:00", end: "09:30", eventId: "evt-1" });
+    expect(calls).toEqual([
+      "upsert evt-1 task-dentist Dentist 2026-10-07 15:00-16:00",
+      "upsert evt-1 task-dentist Dentist 2026-10-08 15:00-16:00",
+      "upsert evt-1 task-dentist Dentist cleaning 2026-10-08 15:00-16:00",
+      "upsert evt-1 task-dentist Dentist cleaning 2026-10-08 09:00-09:30",
+    ]);
+  });
+
+  it("deletes the event when the appointment is cleared", async () => {
+    const { services, calls } = await setupWithCalendar();
+    const { task } = await services.createTask({ title: "Dentist", dueAt: "2026-10-07", appointment: slot });
+    const updated = await services.updateTask(task.id, { appointment: null });
+    expect(updated.appointment).toBeUndefined();
+    expect(calls.at(-1)).toBe("remove evt-1");
+  });
+
+  it("keeps the task when the calendar fails, and retries on the next update", async () => {
+    const { services, calls, fail } = await setupWithCalendar();
+    fail(true);
+    const created = await services.createTask({ title: "Dentist", dueAt: "2026-10-07", appointment: slot });
+    expect(created.calendarError).toMatch(/offline.*retry/);
+    expect(created.task.appointment?.eventId).toBeUndefined();
+    fail(false);
+    const retried = await services.updateTask(created.task.id, {});
+    expect(retried.calendarError).toBeUndefined();
+    expect(retried.appointment?.eventId).toBe("evt-1");
+    expect(calls).toHaveLength(1);
+  });
+
+  it("rejects appointments that aren't a same-day slot on a dated ad hoc task", async () => {
+    const { services } = await setupWithCalendar();
+    const code = (p: Promise<unknown>) => p.then(() => "ok", (e: DomainError) => e.code);
+    expect(await code(services.createTask({ title: "x", appointment: slot }))).toBe("INVALID_INPUT");
+    expect(await code(services.createTask({ title: "x", rrule: "FREQ=DAILY", appointment: slot }))).toBe("INVALID_INPUT");
+    expect(await code(services.createTask({ title: "x", dueAt: "2026-10-07", appointment: { start: "10:00", end: "09:00" } })))
+      .toBe("INVALID_INPUT");
+    expect(await code(services.createTask({ title: "x", dueAt: "2026-10-07", appointment: { start: "3pm", end: "4pm" } })))
+      .toBe("INVALID_INPUT");
+    const { task } = await services.createTask({ title: "Dentist", dueAt: "2026-10-07", appointment: slot });
+    expect(await code(services.updateTask(task.id, { dueAt: null }))).toBe("INVALID_INPUT");
+    expect(await code(services.updateTask(task.id, { rrule: "FREQ=DAILY" }))).toBe("INVALID_INPUT");
+  });
+
+  it("are unavailable without a calendar", async () => {
+    const { services } = await setup("2026-10-05");
+    await expect(services.createTask({ title: "x", dueAt: "2026-10-07", appointment: slot })).rejects.toMatchObject({
+      code: "CALENDAR_UNAVAILABLE",
+    });
   });
 });

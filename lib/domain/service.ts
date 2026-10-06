@@ -1,3 +1,4 @@
+import { type AppointmentCalendar, appointmentCalendar } from "@/lib/calendar/appointments";
 import { DATA_FILE, MAX_RANGE_DAYS, TIME_ZONE } from "./config";
 import { dateIn, daysBetween, parseDate } from "./dates";
 import { ensureOccurrences, resolveMisses } from "./engine";
@@ -5,10 +6,12 @@ import { slugify, uniqueId } from "./ids";
 import { validateRule } from "./recurrence";
 import { createStore, type Store } from "./store";
 import {
+  type Appointment,
   DomainError,
   type Goal,
   type GoalStatus,
   type ISODate,
+  LocalTime,
   type MissPolicy,
   type Occurrence,
   type OccurrenceStatus,
@@ -33,6 +36,8 @@ export type AgendaItem = {
   overdue: boolean;
   recurring: boolean;
   dueAt?: ISODate;
+  /** Time slot on dueAt, also on the user's Google Calendar. */
+  appointment?: AppointmentInput;
   /** From the task's goals, else its fallback pillar; empty = unaligned. */
   pillars: Pillar[];
   goals: { id: string; title: string; pillar: Pillar }[];
@@ -55,11 +60,15 @@ export type PillarSummary = {
 
 export type GoalListItem = Goal & { childIds: string[]; taskCount: number };
 
+/** An appointment as callers give it; the event link is managed by the service. */
+export type AppointmentInput = { start: string; end: string; location?: string };
+
 export type CreateTaskInput = {
   title: string;
   rrule?: string;
   startDate?: string;
   dueAt?: string;
+  appointment?: AppointmentInput;
   goalIds?: string[];
   pillar?: Pillar;
   missPolicy?: MissPolicy;
@@ -71,11 +80,16 @@ export type UpdateTaskInput = {
   rrule?: string | null;
   startDate?: string;
   dueAt?: string | null;
+  /** Replaces the whole time slot; null makes it a plain to-do again and deletes its calendar event. */
+  appointment?: AppointmentInput | null;
   goalIds?: string[];
   pillar?: Pillar | null;
   missPolicy?: MissPolicy;
   active?: boolean;
 };
+
+/** Set when the task was saved but its Google Calendar event couldn't be; the task itself is fine. */
+export type CalendarSync = { calendarError?: string };
 
 export type CreateGoalInput = {
   pillar: Pillar;
@@ -96,6 +110,10 @@ export type UpdateGoalInput = {
 export type ListTasksInput = { active?: boolean; goalId?: string; pillar?: Pillar };
 
 const zeroCounts = (): Counts => ({ done: 0, skipped: 0, pending: 0 });
+
+const withoutEventId = ({ eventId: _, ...rest }: Appointment): AppointmentInput => rest;
+const withEventId = (appointment: Appointment | undefined) =>
+  appointment?.eventId ? { eventId: appointment.eventId } : {};
 
 export function taskPillars(task: Task, goalsById: Map<string, Goal>): Pillar[] {
   const pillars = new Set<Pillar>();
@@ -119,10 +137,13 @@ export function createServices({
   store,
   timeZone,
   now = () => new Date(),
+  calendar = null,
 }: {
   store: Store;
   timeZone: string;
   now?: () => Date;
+  /** Mirrors appointment tasks to Google Calendar; null = appointments are unavailable. */
+  calendar?: AppointmentCalendar | null;
 }) {
   const today = () => dateIn(timeZone, now());
   const timestamp = () => now().toISOString();
@@ -164,6 +185,7 @@ export function createServices({
         overdue: o.status === "pending" && o.scheduledFor < t,
         recurring: Boolean(task.rrule),
         ...(task.dueAt ? { dueAt: task.dueAt } : {}),
+        ...(task.appointment ? { appointment: withoutEventId(task.appointment) } : {}),
         pillars: taskPillars(task, goalsById),
         goals,
       };
@@ -191,6 +213,51 @@ export function createServices({
     }
   }
 
+  function parseAppointment(input: AppointmentInput): AppointmentInput {
+    if (!calendar) throw new DomainError("CALENDAR_UNAVAILABLE", "Google Calendar isn't configured");
+    for (const field of ["start", "end"] as const) {
+      if (!LocalTime.safeParse(input[field]).success) {
+        throw new DomainError("INVALID_INPUT", `appointment.${field} must be HH:mm (24-hour), got "${input[field]}"`);
+      }
+    }
+    if (input.end <= input.start) {
+      throw new DomainError("INVALID_INPUT", "appointment.end must be after appointment.start");
+    }
+    const location = input.location?.trim();
+    return { start: input.start, end: input.end, ...(location ? { location } : {}) };
+  }
+
+  /** Appointments are a time slot on one day, so only ad hoc tasks with a due date can have one. */
+  function checkAppointmentTask(task: Pick<Task, "rrule" | "dueAt" | "appointment">) {
+    if (task.appointment && (task.rrule || !task.dueAt)) {
+      throw new DomainError(
+        "INVALID_INPUT",
+        "An appointment needs an ad hoc task (no rrule) with dueAt; clear it with appointment: null first",
+      );
+    }
+  }
+
+  /** Creates or updates the task's calendar event and stores its id. Failures are reported, not thrown. */
+  async function syncAppointment(task: Task): Promise<Task & CalendarSync> {
+    if (!task.appointment || !task.dueAt) return task;
+    if (!calendar) return { ...task, calendarError: "Google Calendar isn't configured; the event was not updated" };
+    let eventId: string;
+    try {
+      const { id: taskId, title, dueAt: date, appointment } = task;
+      eventId = await calendar.upsert({ taskId, title, date, appointment });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return { ...task, calendarError: `${message}. The task is saved; call updateTask with its id to retry the sync.` };
+    }
+    if (eventId === task.appointment.eventId) return task;
+    return store.mutate((draft) => {
+      const saved = draft.tasks.find((t) => t.id === task.id);
+      if (!saved?.appointment) return { changed: false, result: saved ?? task };
+      saved.appointment.eventId = eventId;
+      return { changed: true, result: saved };
+    });
+  }
+
   function setOccurrenceStatus(id: string, status: OccurrenceStatus, note: string | undefined): Promise<AgendaItem> {
     return store.mutate((draft) => {
       const occurrence = find(draft.occurrences, id, "occurrence");
@@ -212,14 +279,15 @@ export function createServices({
    * never touched. A new rule without a new startDate is anchored at today so it doesn't
    * backfill past days as overdue.
    */
-  async function updateTask(id: string, patch: UpdateTaskInput): Promise<Task> {
+  async function updateTask(id: string, patch: UpdateTaskInput): Promise<Task & CalendarSync> {
     const rrule = patch.rrule == null ? patch.rrule : validateRule(patch.rrule);
+    const appointment = patch.appointment == null ? patch.appointment : parseAppointment(patch.appointment);
     const startDate = patch.startDate === undefined ? undefined : parseDate(patch.startDate, "startDate");
     const dueAt = patch.dueAt == null ? patch.dueAt : parseDate(patch.dueAt, "dueAt");
     const title = patch.title?.trim();
     if (title === "") throw new DomainError("INVALID_INPUT", "title must not be empty");
 
-    return store.mutate((draft) => {
+    const { old, next } = await store.mutate((draft) => {
       const index = draft.tasks.findIndex((t) => t.id === id);
       if (index === -1) throw new DomainError("NOT_FOUND", `No task with id "${id}"`);
       const old = draft.tasks[index];
@@ -242,6 +310,9 @@ export function createServices({
         if (dueAt) throw new DomainError("INVALID_INPUT", "dueAt is only for ad hoc tasks (no rrule)");
         delete next.dueAt;
       }
+      if (appointment === null) delete next.appointment;
+      else if (appointment) next.appointment = { ...appointment, ...withEventId(old.appointment) };
+      checkAppointmentTask(next);
 
       const ruleChanged = (old.rrule ?? null) !== (next.rrule ?? null);
       const reactivated = !old.active && next.active;
@@ -270,8 +341,27 @@ export function createServices({
       }
 
       draft.tasks[index] = next;
-      return { changed: true, result: next };
+      return { changed: true, result: { old, next } };
     });
+
+    // The event follows renames and reschedules; archiving or skipping leaves it on the calendar.
+    const eventId = old.appointment?.eventId;
+    if (eventId && !next.appointment) {
+      if (!calendar) return { ...next, calendarError: "Google Calendar isn't configured; the event was not deleted" };
+      try {
+        await calendar.remove(eventId);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return { ...next, calendarError: `${message}. The task is saved, but its old event is still on the calendar.` };
+      }
+      return next;
+    }
+    const eventChanged =
+      !next.appointment?.eventId ||
+      next.title !== old.title ||
+      next.dueAt !== old.dueAt ||
+      JSON.stringify(next.appointment) !== JSON.stringify(old.appointment);
+    return next.active && eventChanged ? syncAppointment(next) : next;
   }
 
   return {
@@ -306,15 +396,17 @@ export function createServices({
     /** Back to pending, e.g. to undo an accidental check-off. */
     reopenOccurrence: (id: string) => setOccurrenceStatus(id, "pending", undefined),
 
-    async createTask(input: CreateTaskInput): Promise<{ task: Task; occurrence?: Occurrence }> {
+    async createTask(input: CreateTaskInput): Promise<{ task: Task; occurrence?: Occurrence } & CalendarSync> {
       const rrule = input.rrule === undefined ? undefined : validateRule(input.rrule);
       const startDate = input.startDate === undefined ? today() : parseDate(input.startDate, "startDate");
       const dueAt = input.dueAt === undefined ? undefined : parseDate(input.dueAt, "dueAt");
       if (rrule && dueAt) throw new DomainError("INVALID_INPUT", "dueAt is only for ad hoc tasks (no rrule)");
       const title = input.title.trim();
       if (!title) throw new DomainError("INVALID_INPUT", "title is required");
+      const appointment = input.appointment === undefined ? undefined : parseAppointment(input.appointment);
+      checkAppointmentTask({ rrule, dueAt, appointment });
 
-      return store.mutate<{ task: Task; occurrence?: Occurrence }>((draft) => {
+      const created = await store.mutate<{ task: Task; occurrence?: Occurrence }>((draft) => {
         const goalIds = input.goalIds ?? [];
         checkGoalIds(draft, goalIds);
         const stamp = timestamp();
@@ -326,6 +418,7 @@ export function createServices({
           ...(rrule ? { rrule } : {}),
           startDate,
           ...(dueAt ? { dueAt } : {}),
+          ...(appointment ? { appointment } : {}),
           missPolicy: input.missPolicy ?? "carry",
           active: true,
           createdAt: stamp,
@@ -343,6 +436,9 @@ export function createServices({
         draft.occurrences.push(occurrence);
         return { changed: true, result: { task, occurrence } };
       });
+      if (!created.task.appointment) return created;
+      const { calendarError, ...task } = await syncAppointment(created.task);
+      return { ...created, task, ...(calendarError ? { calendarError } : {}) };
     },
 
     updateTask,
@@ -479,4 +575,8 @@ export function createServices({
 export type Services = ReturnType<typeof createServices>;
 
 /** The app-wide instance used by API routes and agent tools. */
-export const services = createServices({ store: createStore(DATA_FILE, TIME_ZONE), timeZone: TIME_ZONE });
+export const services = createServices({
+  store: createStore(DATA_FILE, TIME_ZONE),
+  timeZone: TIME_ZONE,
+  calendar: appointmentCalendar,
+});

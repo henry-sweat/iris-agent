@@ -1,4 +1,5 @@
 import { query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { calendarService } from "@/lib/calendar/service";
 import { buildSystemPrompt } from "./system-prompt";
 import { createTodoServer, TODO_SERVER } from "./tools";
 
@@ -42,7 +43,7 @@ export async function* runAgent({
     prompt: prompt(),
     options: {
       model: MODEL,
-      systemPrompt: buildSystemPrompt(),
+      systemPrompt: buildSystemPrompt(new Date(), { calendar: calendarService !== null }),
       mcpServers: { [TODO_SERVER]: createTodoServer() },
       tools: [], // No built-in tools (Bash, Read, Edit, …): todos only.
       allowedTools: [`mcp__${TODO_SERVER}__*`],

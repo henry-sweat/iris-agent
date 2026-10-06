@@ -2,14 +2,18 @@ import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import type { CalendarService } from "@/lib/calendar/service";
 import { createServices } from "@/lib/domain/service";
 import { createStore } from "@/lib/domain/store";
 import { createTodoTools, MUTATING_TOOLS } from "./tools";
 
-async function tools() {
+async function tools(calendar: CalendarService | null = null) {
   const file = path.join(await mkdtemp(path.join(tmpdir(), "todo-agent-")), "todo.json");
   await writeFile(file, JSON.stringify({ version: 2, goals: [], tasks: [], occurrences: [] }));
-  return createTodoTools(createServices({ store: createStore(file, "America/New_York"), timeZone: "America/New_York" }));
+  return createTodoTools(
+    createServices({ store: createStore(file, "America/New_York"), timeZone: "America/New_York" }),
+    calendar,
+  );
 }
 
 describe("agent tools", () => {
@@ -34,5 +38,12 @@ describe("agent tools", () => {
     expect(result.isError).toBe(true);
     const text = result.content[0].type === "text" ? result.content[0].text : "";
     expect(JSON.parse(text)).toMatchObject({ code: "INVALID_RRULE" });
+  });
+
+  it("include the calendar tool only when a calendar is configured", async () => {
+    expect((await tools()).map((t) => t.name)).not.toContain("getCalendarEvents");
+    const calendar = { listEvents: async () => ({}) } as unknown as CalendarService;
+    expect((await tools(calendar)).map((t) => t.name)).toContain("getCalendarEvents");
+    expect(MUTATING_TOOLS.has("getCalendarEvents")).toBe(false);
   });
 });

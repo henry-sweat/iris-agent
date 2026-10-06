@@ -9,6 +9,7 @@ const STATUS: Record<DomainError["code"], number> = {
   UNKNOWN_GOAL: 400,
   GOAL_PILLAR_MISMATCH: 409,
   GOAL_CYCLE: 409,
+  CALENDAR_UNAVAILABLE: 502,
 };
 
 /** Runs a service call, mapping DomainErrors to `{ code, message }` with a 4xx status. */
