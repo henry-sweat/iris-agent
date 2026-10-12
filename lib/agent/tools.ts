@@ -15,6 +15,7 @@ export const MUTATING_TOOLS = new Set([
   "archiveTask",
   "createGoal",
   "updateGoal",
+  "saveReview",
 ]);
 
 const json = (value: unknown) => ({
@@ -179,6 +180,21 @@ export function createTodoTools(
       "done/skipped/pending counts per pillar and per goal over [from, to], plus unaligned counts.",
       { from: date("Range start"), to: date("Range end, inclusive") },
       guarded(({ from, to }) => services.getPillarSummary(from, to)),
+    ),
+    tool(
+      "getReview",
+      "Behavior data for a start-of-day review: yesterday's occurrences; per recurring task the last 7 days vs the 4 weeks before (done rates), current streak, weekdays it's usually missed, late check-offs and logged notes; pillar rates week vs baseline; overdue items with their age; active goals with nothing done this week; the last 2 saved reviews.",
+      {},
+      guarded(() => services.getReview()),
+    ),
+    tool(
+      "saveReview",
+      "Save today's review (replaces one already saved today) so the next review can follow up on it.",
+      {
+        summary: z.string().min(1).describe("What the user said about their patterns, in a few sentences"),
+        experiments: z.array(z.string()).optional().describe("Small changes the user agreed to try"),
+      },
+      guarded((args) => services.saveReview(args)),
     ),
   ];
   if (!calendar) return tools;

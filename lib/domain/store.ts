@@ -16,7 +16,7 @@ export type Store = {
   mutate<T>(fn: (draft: StoreData) => { changed: boolean; result: T }): Promise<T>;
 };
 
-const EMPTY: StoreData = { version: 2, goals: [], tasks: [], occurrences: [] };
+const EMPTY: StoreData = { version: 3, goals: [], tasks: [], occurrences: [], reviews: [] };
 
 // One queue per file per process. Kept on globalThis so HMR or separate route bundles
 // can't create a second queue writing the same file.
@@ -33,7 +33,12 @@ export function createStore(file: string, timeZone: string): Store {
       throw error;
     }
     if (Array.isArray(raw)) {
-      const migrated = migrateV1(raw, timeZone);
+      const migrated = migrateV2(migrateV1(raw, timeZone));
+      await save(migrated);
+      return migrated;
+    }
+    if ((raw as { version?: unknown }).version === 2) {
+      const migrated = migrateV2(raw);
       await save(migrated);
       return migrated;
     }
@@ -85,7 +90,7 @@ const V1Todo = z.object({
  * its creation date (done stays done; open/in_progress/blocked become pending), and the seed
  * goals and tasks are added.
  */
-export function migrateV1(raw: unknown[], timeZone: string): StoreData {
+export function migrateV1(raw: unknown[], timeZone: string): V2Data {
   const todos = z.array(V1Todo).parse(raw);
   const tasks: Task[] = [];
   const occurrences: Occurrence[] = [];
@@ -118,4 +123,15 @@ export function migrateV1(raw: unknown[], timeZone: string): StoreData {
     tasks: [...structuredClone(seedTasks).filter((t) => !taken.has(t.id)), ...tasks],
     occurrences,
   };
+}
+
+// ── v2 → v3 migration ────────────────────────────────────────────────────────
+
+type V2Data = Omit<StoreData, "version" | "reviews"> & { version: 2 };
+const V2Data = StoreData.omit({ reviews: true }).extend({ version: z.literal(2) });
+
+/** v3 adds the review log; everything else is unchanged. */
+export function migrateV2(raw: unknown): StoreData {
+  const data = V2Data.parse(raw);
+  return { ...data, version: 3, reviews: [] };
 }

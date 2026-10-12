@@ -6,7 +6,7 @@ import type { AppointmentCalendar } from "@/lib/calendar/appointments";
 import { addDays } from "./dates";
 import { createServices } from "./service";
 import { createStore } from "./store";
-import { DomainError, type Goal, type StoreData, type Task } from "./types";
+import { DomainError, type Goal, type Occurrence, type StoreData, type Task } from "./types";
 
 const TZ = "America/New_York";
 const STAMP = "2026-10-01T12:00:00-04:00";
@@ -14,7 +14,7 @@ const STAMP = "2026-10-01T12:00:00-04:00";
 async function setup(today: string, data: Partial<StoreData> = {}) {
   const dir = await mkdtemp(path.join(tmpdir(), "todo-agent-"));
   const file = path.join(dir, "todo.json");
-  await writeFile(file, JSON.stringify({ version: 2, goals: [], tasks: [], occurrences: [], ...data }));
+  await writeFile(file, JSON.stringify({ version: 3, goals: [], tasks: [], occurrences: [], reviews: [], ...data }));
   const clock = { today };
   const store = createStore(file, TZ);
   // Noon in New York on clock.today.
@@ -322,6 +322,111 @@ describe("getPillarSummary", () => {
     ]);
     expect(summary.unaligned).toEqual({ done: 0, skipped: 0, pending: 1 });
     expect(summary.unalignedTaskCount).toBe(1);
+  });
+});
+
+describe("reviews", () => {
+  // Today is Thu 2026-10-15: the week is Oct 8-14 and the baseline Sep 10 - Oct 7.
+  function occ(taskId: string, date: string, status: Occurrence["status"], fields: Partial<Occurrence> = {}): Occurrence {
+    return {
+      id: `${taskId}@${date}`,
+      taskId,
+      scheduledFor: date,
+      status,
+      ...(status === "done" ? { completedAt: `${date}T16:00:00Z` } : {}),
+      ...fields,
+    };
+  }
+
+  async function setupReview() {
+    const occurrences: Occurrence[] = [];
+    // Gym: every day for 5 weeks, missed on two Wednesdays (Oct 7 and Oct 14).
+    for (let d = "2026-09-10"; d <= "2026-10-14"; d = addDays(d, 1)) {
+      occurrences.push(occ("gym", d, d === "2026-10-07" || d === "2026-10-14" ? "skipped" : "done"));
+    }
+    // Reading: new this week, never missed; Oct 13 was checked off a day late.
+    for (let d = "2026-10-11"; d <= "2026-10-14"; d = addDays(d, 1)) {
+      occurrences.push(
+        occ("read", d, "done", {
+          ...(d === "2026-10-12" ? { note: "20 pages" } : {}),
+          ...(d === "2026-10-13" ? { completedAt: "2026-10-14T16:00:00Z" } : {}),
+        }),
+      );
+    }
+    occurrences.push(occ("taxes", "2026-10-10", "pending"));
+    return setup("2026-10-15", {
+      goals: [goal("fit"), goal("money", { pillar: "wealth" }), goal("paused", { status: "paused" })],
+      tasks: [
+        task("gym", { rrule: "FREQ=DAILY", startDate: "2026-09-10", goalIds: ["fit"] }),
+        task("read", { rrule: "FREQ=DAILY", startDate: "2026-10-11", pillar: "happiness" }),
+        task("taxes", { dueAt: "2026-10-10", startDate: "2026-10-01", goalIds: ["money"] }),
+        task("idle", { dueAt: "2026-11-01", goalIds: ["paused"] }),
+      ],
+      occurrences,
+    });
+  }
+
+  it("computes habit rates, streaks, weak weekdays, late check-offs and notes", async () => {
+    const { services } = await setupReview();
+    const review = await services.getReview();
+    expect(review.week).toEqual({ from: "2026-10-08", to: "2026-10-14" });
+    expect(review.baseline).toEqual({ from: "2026-09-10", to: "2026-10-07" });
+    expect(review.yesterday.map((i) => i.occurrenceId)).toEqual(["gym@2026-10-14", "read@2026-10-14"]);
+    // Biggest drop from baseline first.
+    expect(review.habits).toEqual([
+      {
+        taskId: "gym",
+        title: "gym",
+        pillars: ["health"],
+        week: { done: 6, skipped: 1, pending: 0 },
+        weekRate: 0.86,
+        baselineRate: 0.96,
+        streak: 0,
+        missedWeekdays: [{ weekday: "Wednesday", misses: 2 }],
+        lateCount: 0,
+        notes: [],
+      },
+      {
+        taskId: "read",
+        title: "read",
+        pillars: ["happiness"],
+        week: { done: 4, skipped: 0, pending: 0 },
+        weekRate: 1,
+        baselineRate: null,
+        streak: 4,
+        missedWeekdays: [],
+        lateCount: 1,
+        notes: [{ date: "2026-10-12", note: "20 pages" }],
+      },
+    ]);
+    expect(review.pillars.health).toEqual({ week: 0.86, baseline: 0.96 });
+    expect(review.pillars.happiness).toEqual({ week: 1, baseline: null });
+  });
+
+  it("lists overdue items by age and goals with nothing done this week", async () => {
+    const { services } = await setupReview();
+    const review = await services.getReview();
+    expect(review.overdue.map((o) => [o.occurrenceId, o.ageDays])).toEqual([["taxes@2026-10-10", 5]]);
+    // fit had gym done this week; paused goals are left out.
+    expect(review.quietGoals).toEqual([{ goalId: "money", title: "money", pillar: "wealth", taskCount: 1 }]);
+  });
+
+  it("saves one review per day and returns the latest two", async () => {
+    const { services, clock } = await setup("2026-10-13");
+    await services.saveReview({ summary: "first", experiments: ["gym in the morning"] });
+    clock.today = "2026-10-14";
+    const draft = await services.saveReview({ summary: "draft" });
+    const saved = await services.saveReview({ summary: " Wednesdays are packed ", experiments: [" move gym ", ""] });
+    expect(saved).toMatchObject({ id: "2026-10-14", summary: "Wednesdays are packed", experiments: ["move gym"] });
+    expect(saved.createdAt).toBe(draft.createdAt);
+    clock.today = "2026-10-15";
+    await services.saveReview({ summary: "third" });
+    const { recentReviews } = await services.getReview();
+    expect(recentReviews.map((r) => [r.id, r.summary])).toEqual([
+      ["2026-10-15", "third"],
+      ["2026-10-14", "Wednesdays are packed"],
+    ]);
+    await expectCode(services.saveReview({ summary: "  " }), "INVALID_INPUT");
   });
 });
 

@@ -2,7 +2,7 @@
 
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
-import { AlertCircleIcon, BrainIcon, CalendarCheckIcon, ListTodoIcon, PlusIcon } from "lucide-react";
+import { AlertCircleIcon, BrainIcon, CalendarCheckIcon, HistoryIcon, ListTodoIcon, PlusIcon, SunriseIcon } from "lucide-react";
 import { useRef, useState } from "react";
 import {
   Conversation,
@@ -27,6 +27,7 @@ import { TodoPanel } from "./todo-panel";
 
 const AGENT_NAME = "Todo Agent";
 const STARTER_PROMPT = "What's on my agenda today, and where should I start?";
+const REVIEW_PROMPT = "Review yesterday and my past week.";
 
 export function AgentChat({
   sessionId: initialSessionId,
@@ -156,9 +157,16 @@ export function AgentChat({
           )}
           <div className="w-full">{composer}</div>
           {showConversationLayout ? null : (
-            <Button onClick={() => send(STARTER_PROMPT)} size="sm" type="button" variant="outline">
-              Where should I start?
-            </Button>
+            <div className="flex flex-wrap justify-center gap-2">
+              <Button onClick={() => send(STARTER_PROMPT)} size="sm" type="button" variant="outline">
+                <SunriseIcon className="size-4" />
+                Where should I start?
+              </Button>
+              <Button onClick={() => send(REVIEW_PROMPT)} size="sm" type="button" variant="outline">
+                <HistoryIcon className="size-4" />
+                Review my day &amp; week
+              </Button>
+            </div>
           )}
         </div>
       </div>

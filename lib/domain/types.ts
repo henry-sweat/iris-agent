@@ -86,11 +86,23 @@ export const Occurrence = z.object({
 });
 export type Occurrence = z.infer<typeof Occurrence>;
 
+/** One start-of-day review: what the user said and the experiments they agreed to try. */
+export const Review = z.object({
+  /** The review date; one review per day. */
+  id: ISODate,
+  summary: z.string(),
+  experiments: z.array(z.string()),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+export type Review = z.infer<typeof Review>;
+
 export const StoreData = z.object({
-  version: z.literal(2),
+  version: z.literal(3),
   goals: z.array(Goal),
   tasks: z.array(Task),
   occurrences: z.array(Occurrence),
+  reviews: z.array(Review),
 });
 export type StoreData = z.infer<typeof StoreData>;
 

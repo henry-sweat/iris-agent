@@ -9,7 +9,7 @@ import { createTodoTools, MUTATING_TOOLS } from "./tools";
 
 async function tools(calendar: CalendarService | null = null) {
   const file = path.join(await mkdtemp(path.join(tmpdir(), "todo-agent-")), "todo.json");
-  await writeFile(file, JSON.stringify({ version: 2, goals: [], tasks: [], occurrences: [] }));
+  await writeFile(file, JSON.stringify({ version: 3, goals: [], tasks: [], occurrences: [], reviews: [] }));
   return createTodoTools(
     createServices({ store: createStore(file, "America/New_York"), timeZone: "America/New_York" }),
     calendar,

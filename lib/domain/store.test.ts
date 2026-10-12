@@ -39,8 +39,22 @@ describe("v1 → v2 migration", () => {
         completedAt: "2026-09-29T15:00:00.000Z",
       },
     ]);
-    // Written back as v2.
-    expect(JSON.parse(await readFile(file, "utf8")).version).toBe(2);
+    expect(data.reviews).toEqual([]);
+    // Written back as the current version.
+    expect(JSON.parse(await readFile(file, "utf8")).version).toBe(3);
+  });
+});
+
+describe("v2 → v3 migration", () => {
+  it("adds an empty review log and keeps everything else", async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "todo-agent-"));
+    const file = path.join(dir, "todo.json");
+    const v2 = { version: 2, goals: seedGoals, tasks: seedTasks, occurrences: [] };
+    await writeFile(file, JSON.stringify(v2));
+
+    const data = await createStore(file, "America/New_York").read();
+    expect(data).toEqual({ ...v2, version: 3, reviews: [] });
+    expect(JSON.parse(await readFile(file, "utf8"))).toEqual(data);
   });
 });
 
@@ -50,8 +64,8 @@ describe("missing data file", () => {
     const file = path.join(dir, "nested", "data", "todo.json");
     const store = createStore(file, "America/New_York");
 
-    expect(await store.read()).toEqual({ version: 2, goals: [], tasks: [], occurrences: [] });
+    expect(await store.read()).toEqual({ version: 3, goals: [], tasks: [], occurrences: [], reviews: [] });
     await store.mutate(() => ({ changed: true, result: undefined }));
-    expect(JSON.parse(await readFile(file, "utf8")).version).toBe(2);
+    expect(JSON.parse(await readFile(file, "utf8")).version).toBe(3);
   });
 });

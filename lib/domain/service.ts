@@ -1,6 +1,6 @@
 import { type AppointmentCalendar, appointmentCalendar } from "@/lib/calendar/appointments";
 import { DATA_FILE, MAX_RANGE_DAYS, TIME_ZONE } from "./config";
-import { dateIn, daysBetween, parseDate } from "./dates";
+import { addDays, dateIn, daysBetween, isoToUTC, parseDate } from "./dates";
 import { ensureOccurrences, resolveMisses } from "./engine";
 import { slugify, uniqueId } from "./ids";
 import { validateRule } from "./recurrence";
@@ -18,6 +18,7 @@ import {
   occurrenceId,
   type Pillar,
   PILLARS,
+  type Review,
   type StoreData,
   type Task,
 } from "./types";
@@ -59,6 +60,45 @@ export type PillarSummary = {
 };
 
 export type GoalListItem = Goal & { childIds: string[]; taskCount: number };
+
+/** done / all scheduled; null when nothing was scheduled. */
+export type Rate = number | null;
+
+export type HabitReview = {
+  taskId: string;
+  title: string;
+  pillars: Pillar[];
+  week: Counts;
+  weekRate: Rate;
+  /** The 4 weeks before the review week. */
+  baselineRate: Rate;
+  /** Consecutive done occurrences counting back from yesterday. */
+  streak: number;
+  /** Weekdays with 2+ skipped or pending occurrences in the last 5 weeks. */
+  missedWeekdays: { weekday: string; misses: number }[];
+  /** Done occurrences checked off after their day. */
+  lateCount: number;
+  /** Notes in the last 5 weeks, e.g. logged values. */
+  notes: { date: ISODate; note: string }[];
+};
+
+export type ReviewData = {
+  today: ISODate;
+  yesterday: AgendaItem[];
+  week: { from: ISODate; to: ISODate };
+  baseline: { from: ISODate; to: ISODate };
+  /** Recurring tasks, biggest drop from baseline first. */
+  habits: HabitReview[];
+  pillars: Record<Pillar, { week: Rate; baseline: Rate }>;
+  /** Pending occurrences before today, oldest first. */
+  overdue: (AgendaItem & { ageDays: number })[];
+  /** Active goals with active tasks but nothing done in the review week. */
+  quietGoals: { goalId: string; title: string; pillar: Pillar; taskCount: number }[];
+  /** The latest saved reviews, newest first. */
+  recentReviews: Review[];
+};
+
+export type SaveReviewInput = { summary: string; experiments?: string[] };
 
 /** An appointment as callers give it; the event link is managed by the service. */
 export type AppointmentInput = { start: string; end: string; location?: string };
@@ -124,6 +164,13 @@ export function taskPillars(task: Task, goalsById: Map<string, Goal>): Pillar[] 
   if (pillars.size === 0 && task.pillar) pillars.add(task.pillar);
   return PILLARS.filter((p) => pillars.has(p));
 }
+
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+const rate = ({ done, skipped, pending }: Counts): Rate => {
+  const total = done + skipped + pending;
+  return total === 0 ? null : Math.round((done / total) * 100) / 100;
+};
 
 const isUnaligned = (task: Task) => task.goalIds.length === 0 && !task.pillar;
 
@@ -364,6 +411,98 @@ export function createServices({
     return next.active && eventChanged ? syncAppointment(next) : next;
   }
 
+  function buildReview(draft: StoreData): ReviewData {
+    const t = today();
+    const yesterday = addDays(t, -1);
+    const week = { from: addDays(t, -7), to: yesterday };
+    const baseline = { from: addDays(t, -35), to: addDays(t, -8) };
+    const goalsById = new Map(draft.goals.map((g) => [g.id, g]));
+    const tasksById = new Map(draft.tasks.map((task) => [task.id, task]));
+    const toItem = itemBuilder(draft);
+    const inWindow = (o: Occurrence) => o.scheduledFor >= baseline.from && o.scheduledFor <= yesterday;
+    const inWeek = (o: Occurrence) => o.scheduledFor >= week.from;
+
+    const byTask = new Map<string, Occurrence[]>();
+    for (const o of draft.occurrences) {
+      if (!inWindow(o)) continue;
+      const list = byTask.get(o.taskId) ?? [];
+      list.push(o);
+      byTask.set(o.taskId, list);
+    }
+
+    const habits: HabitReview[] = [];
+    for (const [taskId, list] of byTask) {
+      const task = tasksById.get(taskId)!;
+      if (!task.rrule) continue;
+      list.sort((a, b) => a.scheduledFor.localeCompare(b.scheduledFor));
+      const weekCounts = zeroCounts();
+      const baselineCounts = zeroCounts();
+      const misses = new Map<number, number>();
+      let lateCount = 0;
+      for (const o of list) {
+        (inWeek(o) ? weekCounts : baselineCounts)[o.status] += 1;
+        if (o.status === "done") {
+          if (o.completedAt && dateIn(timeZone, new Date(o.completedAt)) > o.scheduledFor) lateCount += 1;
+        } else {
+          const day = isoToUTC(o.scheduledFor).getUTCDay();
+          misses.set(day, (misses.get(day) ?? 0) + 1);
+        }
+      }
+      let streak = 0;
+      for (let i = list.length - 1; i >= 0 && list[i].status === "done"; i--) streak += 1;
+      habits.push({
+        taskId,
+        title: task.title,
+        pillars: taskPillars(task, goalsById),
+        week: weekCounts,
+        weekRate: rate(weekCounts),
+        baselineRate: rate(baselineCounts),
+        streak,
+        missedWeekdays: [...misses]
+          .filter(([, n]) => n >= 2)
+          .sort(([a], [b]) => a - b)
+          .map(([day, n]) => ({ weekday: WEEKDAYS[day], misses: n })),
+        lateCount,
+        notes: list.flatMap((o) => (o.note ? [{ date: o.scheduledFor, note: o.note }] : [])),
+      });
+    }
+    const drop = (h: HabitReview) => (h.baselineRate ?? h.weekRate ?? 0) - (h.weekRate ?? 0);
+    habits.sort((a, b) => drop(b) - drop(a));
+
+    const pillarCounts = Object.fromEntries(
+      PILLARS.map((p) => [p, { week: zeroCounts(), baseline: zeroCounts() }]),
+    ) as Record<Pillar, { week: Counts; baseline: Counts }>;
+    const doneGoals = new Set<string>();
+    for (const o of draft.occurrences) {
+      if (!inWindow(o)) continue;
+      const task = tasksById.get(o.taskId)!;
+      for (const p of taskPillars(task, goalsById)) pillarCounts[p][inWeek(o) ? "week" : "baseline"][o.status] += 1;
+      if (inWeek(o) && o.status === "done") for (const g of task.goalIds) doneGoals.add(g);
+    }
+
+    return {
+      today: t,
+      yesterday: draft.occurrences.filter((o) => o.scheduledFor === yesterday).map(toItem),
+      week,
+      baseline,
+      habits,
+      pillars: Object.fromEntries(
+        PILLARS.map((p) => [p, { week: rate(pillarCounts[p].week), baseline: rate(pillarCounts[p].baseline) }]),
+      ) as Record<Pillar, { week: Rate; baseline: Rate }>,
+      overdue: draft.occurrences
+        .filter((o) => o.status === "pending" && o.scheduledFor < t)
+        .sort((a, b) => a.scheduledFor.localeCompare(b.scheduledFor))
+        .map((o) => ({ ...toItem(o), ageDays: daysBetween(o.scheduledFor, t) })),
+      quietGoals: draft.goals.flatMap((g) => {
+        const taskCount = draft.tasks.filter((task) => task.active && task.goalIds.includes(g.id)).length;
+        return g.status === "active" && taskCount > 0 && !doneGoals.has(g.id)
+          ? [{ goalId: g.id, title: g.title, pillar: g.pillar, taskCount }]
+          : [];
+      }),
+      recentReviews: draft.reviews.toSorted((a, b) => b.id.localeCompare(a.id)).slice(0, 2),
+    };
+  }
+
   return {
     today,
 
@@ -535,6 +674,36 @@ export function createServices({
           childIds: data.goals.filter((c) => c.parentId === g.id).map((c) => c.id),
           taskCount: data.tasks.filter((t) => t.active && t.goalIds.includes(g.id)).length,
         }));
+    },
+
+    /** Behavior patterns for a start-of-day review: yesterday, the last 7 days vs the 4 weeks before, past reviews. */
+    async getReview(): Promise<ReviewData> {
+      return store.mutate((draft) => {
+        const t = today();
+        const changed = heal(draft, addDays(t, -35), addDays(t, -1));
+        return { changed, result: buildReview(draft) };
+      });
+    },
+
+    /** Records today's review; saving again the same day replaces it. */
+    async saveReview(input: SaveReviewInput): Promise<Review> {
+      const summary = input.summary.trim();
+      if (!summary) throw new DomainError("INVALID_INPUT", "summary is required");
+      const experiments = (input.experiments ?? []).map((e) => e.trim()).filter(Boolean);
+      return store.mutate((draft) => {
+        const id = today();
+        const stamp = timestamp();
+        const existing = draft.reviews.find((r) => r.id === id);
+        const review: Review = {
+          id,
+          summary,
+          experiments,
+          createdAt: existing?.createdAt ?? stamp,
+          updatedAt: stamp,
+        };
+        draft.reviews = [...draft.reviews.filter((r) => r.id !== id), review];
+        return { changed: true, result: review };
+      });
     },
 
     /** done/skipped/pending per pillar and per goal over [from, to] (runs the read path first). */
